@@ -3559,7 +3559,7 @@ and jobs.
 | Example | File, in the `charpente` crate | It shows |
 |---|---|---|
 | `drawn_inputs` | `examples/drawn_inputs.rs` | bids drawn with `sim.input()` (`between`, `pick`, `shuffle`, `text`), a check that holds for any of them and merges the tail's re-sent answers into its judgement, and a `require` on a key the check marks when it judged something |
-| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch flipped between the faulted phase and the tail, a workload that places one order twice under two keys, a route that answers an order already stored as placed, and the three outbound checkers |
+| `modelled_remote` | `examples/modelled_remote.rs` | an outbound job against a `Remote` with its own `Rng`, a calm switch flipped between the faulted phase and the tail, a workload that places one order twice under two keys, and a route that answers an order already stored as placed |
 | `restart_under_faults` | `examples/restart_under_faults.rs` | the recovery drive's four steps over a power cycle, a claim about the faulted phase's acks only, and a `require ["restart"]` |
 
 All three drive the app with `charpente_sim::drive` ("A fault-free tail for an
@@ -5165,7 +5165,8 @@ helper, build the handle before the kernel, since
 `sim.outbound(&app.outbound_hosts())` borrows the app that
 `Kernel::with_outbound` takes. The workload below takes two orders under the
 run's faults, then runs the fault-free tail ("A fault-free tail" above) and
-calls the three outbound checkers:
+judges its own property. `recover` has already run the three outbound rules
+on the tail's store:
 
 ```rust
 use charpente::core::job::JobRow;
@@ -5176,10 +5177,6 @@ use charpente::outbound::{Call, Host, IdempotencyKey, Reply};
 use charpente::wire::WireU64;
 use charpente::{Schema, Tx, View, Wire, job, jobs, route, routes, table};
 use charpente_sim::Sim;
-use charpente_sim::checks::{
-    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_effect,
-    outbound_settles_by_horizon,
-};
 use charpente_sim::drive::Drive;
 use charpente_sim::outbound::{Idempotent, Recorder};
 use serde::{Deserialize, Serialize};
@@ -5292,15 +5289,6 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
         .db()
         .snapshot()
         .map_err(|e| e.to_string())?;
-    keys_are_per_effect(&snap)?;
-    outbound_settles_by_horizon(&snap, recovered.wall)?;
-    if let Err(e) = calls_have_durable_jobs(sim, &snap) {
-        if durable_corruption_fired(sim) {
-            sim.give_up("media corruption cut an enqueue whose call was made", e);
-            return Ok(());
-        }
-        return Err(e);
-    }
     let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
     if jobs.iter().any(|j| j.outbound_key.is_some()) {
         sim.cover("outbound:checked"); // no order committed, nothing checked
@@ -5310,8 +5298,8 @@ fn receipts_settle_under_faults(sim: &mut Sim) -> Result<(), String> {
 ```
 
 Register it as `receipts_settle_under_faults require ["outbound:checked"]`. A
-run in which no order committed passes all three checkers having checked
-nothing, which is why the coverage key is marked only where an outbound job
+run in which no order committed has nothing to check, which is why the
+coverage key is marked only where an outbound job
 exists. `Drive::recover` marks `dead:SendReceipt` for each receipt it took
 to Dead, so `require ["outbound:checked", "dead:SendReceipt"]` also holds
 that the receipt's Dead path ran under the batch's outages. The tail places

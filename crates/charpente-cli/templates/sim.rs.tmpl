@@ -32,7 +32,7 @@ use charpente::core::table::Codec;
 use charpente::http::{App, Method, Request};
 use charpente::{Id, View};
 use charpente_sim::Sim;
-use charpente_sim::checks::{dead_hooks_succeeded, durable_corruption_fired, events};
+use charpente_sim::checks::{durable_corruption_fired, events};
 use charpente_sim::drive::{Drive, Recovered};
 use {{ident}}::{Echo, NewNote, Note, NoteAdded, build_app};
 
@@ -151,10 +151,9 @@ fn acked_note_survives_a_restart(sim: &mut Sim) -> Result<(), String> {
 ///   record, so two `Echo` jobs for one note mean the route enqueued more
 ///   than one in one add, a cause told apart first.
 ///
-/// It also fails a run in which a job's `on_dead` hook failed
-/// (`dead_hooks_succeeded`, GUIDE §8). `Echo` is `retain_dead` and has no
-/// hook, so this passes trivially until a job here declares `on_dead`; from
-/// then on it fails any run in which that hook failed.
+/// `Drive::recover` already fails a run in which a job's `on_dead` hook
+/// failed (GUIDE §8). `Echo` is `retain_dead` and has no hook, so that
+/// passes trivially until a job here declares `on_dead`.
 ///
 /// Delete `tx.enqueue` in `src/lib.rs`, or make `Echo::run` do nothing, and
 /// this goes red with a seed.
@@ -168,7 +167,6 @@ fn acked_post_implies_the_echo_after_recovery(sim: &mut Sim) -> Result<(), Strin
         .db()
         .snapshot()
         .map_err(|e| e.to_string())?;
-    dead_hooks_succeeded(&snap)?;
     let echo_jobs: Vec<JobRow> = snap
         .scan::<JobRow>()
         .map_err(|e| e.to_string())?

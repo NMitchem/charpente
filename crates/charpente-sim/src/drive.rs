@@ -101,8 +101,8 @@ pub struct Recovered {
     /// The wall time the tail stopped at, after its last extension: the
     /// greater of the sim clock's reading and the kernel's held wall (the
     /// latest wall time it handed out, seeded at its open from the store's
-    /// recorded time), the line the kernel judges due times by. The `at`
-    /// that `checks::outbound_settles_by_horizon` judges at.
+    /// recorded time), the line the kernel judges due times by. `recover`
+    /// returns only once no Pending outbound row is due at it.
     pub wall: WallTime,
     /// How many times the tail ran on past its horizon for outbound work, at
     /// most [`TAIL_SETTLE_CAP`]; 0 for an app that declares no host.
@@ -275,7 +275,9 @@ impl<'s> Drive<'s> {
     ///   extension runs past the year 2262. An app with no host has no
     ///   outbound row and is never extended. [`Recovered::extensions`] counts
     ///   the extensions, and [`Recovered::wall`] is the wall time it stopped
-    ///   at, what `checks::outbound_settles_by_horizon` judges at.
+    ///   at. It returns only once no Pending outbound row is due there (its
+    ///   `unsettled` loop), so `checks::outbound_settles_by_horizon` cannot
+    ///   fail after `recover`.
     /// - **Checks.** Then, on one snapshot of the tail's store, it runs
     ///   [`keys_are_per_effect`], [`calls_have_durable_jobs`] and
     ///   [`dead_hooks_succeeded`], in that order, for every app, and fails

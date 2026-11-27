@@ -1187,8 +1187,9 @@ fn checks(
     calls_have_durable_jobs(sim, snap)?;
     keys_are_per_effect(snap)?;
     outbound_settles_by_horizon(snap, at)?;
-    // `dead:<job>` once per Dead row, for a `require:`. `Drive::recover`
-    // calls it itself; a hand driver calls it on its last kernel's App.
+    // `dead:<job>` once per Dead row, for a `require:`. `Drive::recover` runs
+    // this and the three checks above itself; a hand driver calls them on its
+    // last kernel's App.
     mark_dead_coverage(sim, app)?;
     // No `on_dead` hook failed: no Dead row's `last_error` carries the prefix
     // only a failed hook's Dead mark writes.

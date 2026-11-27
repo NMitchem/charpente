@@ -14,10 +14,6 @@ use charpente::core::job::{JobRow, JobStatus};
 use charpente::core::table::Codec as _;
 use charpente::http::{Method, Request};
 use charpente_sim::Sim;
-use charpente_sim::checks::{
-    calls_have_durable_jobs, durable_corruption_fired, keys_are_per_effect,
-    outbound_settles_by_horizon,
-};
 use charpente_sim::drive::Drive;
 use double_charge::{Charge, Order, build_app};
 use gateway::Gateway;
@@ -59,18 +55,6 @@ fn each_order_is_charged_once(sim: &mut Sim) -> Result<(), String> {
         .db()
         .snapshot()
         .map_err(|e| e.to_string())?;
-    keys_are_per_effect(&snap)?;
-    outbound_settles_by_horizon(&snap, recovered.wall)?;
-    if let Err(e) = calls_have_durable_jobs(sim, &snap) {
-        if durable_corruption_fired(sim) {
-            sim.give_up(
-                "injected corruption cut an enqueue after its call reached the gateway",
-                e,
-            );
-            return Ok(());
-        }
-        return Err(e);
-    }
 
     let jobs = snap.scan::<JobRow>().map_err(|e| e.to_string())?;
     let mut charges = Vec::new();

@@ -712,10 +712,10 @@ pub fn keys_are_per_effect(snap: &Snapshot) -> Result<(), String> {
 }
 
 /// After the tail, every outbound job that is due at `at` is Done or Dead
-/// (spec §10; 0.5.0 spec §5 E). `at` is the wall time the tail ended at:
-/// `Recovered::wall` after `Drive::recover` (the greater of the clock's
-/// reading and the kernel's held wall), or `sim.clock().wall()` read after a
-/// hand driver's last run. A Pending row
+/// (spec §10; 0.5.0 spec §5 E). It is for a hand driver: `Drive::recover`
+/// returns only once no Pending outbound row is due at `Recovered::wall`, so
+/// after it this cannot fail. `at` is the wall time the tail ended at,
+/// `sim.clock().wall()` read after the hand driver's last run. A Pending row
 /// with no attempt made and a due time after `at` is not judged: a delayed
 /// enqueue, or a re-issue scheduled later, is not yet due. Every other
 /// Pending outbound row fails, the first by id. Call it only after
