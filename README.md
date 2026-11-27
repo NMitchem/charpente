@@ -177,6 +177,16 @@ and a simulated one. The simulated ones run from one seed, so a run's crashes, t
 replies and clock jumps happen the same way every time it replays. [DESIGN.md][design] has
 the details.
 
+## Where it's going
+
+charpente is working toward 1.0, and its goal in one line is to accept an agent's change
+without reading it, and keep the business you already have. When an agent changes a workflow
+where a mistake costs someone, you'll be able to accept the change from a verdict anyone can
+re-check, one that names which of your promises were checked and what nothing checked. The
+data and unfinished work your app stores from 1.0 on will cross every later charpente
+release. None of this is built yet. [PLAN.md][plan]'s 1.0 section has the stages that lead
+there, and [DECISIONS.md][decisions] §16 records the goal and what would reopen it.
+
 ## Limits
 
 charpente is a technical preview. [CHANGELOG.md][changelog] dates each release once its crates
@@ -186,6 +196,11 @@ are on crates.io. These are the limits you'll hit first:
   it for reads and failover. There is no sharding, and there won't be ([DESIGN.md][design]
   §5). One machine's ceiling is its disk's durable write rate. [docs/BENCH.md][bench] has
   what has been measured, on a dev laptop only.
+- Until 1.0, a release can change charpente's own stored formats. When one does, a node
+  refuses a data directory, replication peer or archive written by another charpente minor,
+  by name, and never converts it. charpente carries your app's own data across your own
+  deploys. Data written by any release before 1.0, release candidates included, won't be
+  carried into 1.0 ([DECISIONS.md][decisions] §15).
 - Apps are written in Rust, and there is no SQL interface: queries are typed Rust calls. charpente
   can generate a TypeScript client for the front end ([docs/GUIDE.md][guide] §14).
 - The simulator drives your app's kernel, not its socket. The HTTP server (`charpente::serve`,
@@ -195,7 +210,8 @@ are on crates.io. These are the limits you'll hit first:
 - The simulator finds only what your checks check. The demo's check counts the charges per order.
 - A `#[route]` answers `200` on success and its handler can't read a request header yet. The
   platform reads one itself: a write's `Idempotency-Key`, which it needs to answer a re-sent
-  write once. Both are rows in [PLAN.md][plan]'s after-launch table.
+  write once. Answering other statuses is 1.0 work, and reading other headers is a row in
+  [PLAN.md][plan]'s after-launch table.
 - There is no blob store and no WebSocket transport, and outbound calls have no `HTTP/2`,
   proxies, request signing or streaming replies.
 - It's for new backends. Porting an existing app is not a goal ([MANIFESTO.md][manifesto] §8).
@@ -219,4 +235,5 @@ are on crates.io. These are the limits you'll hit first:
 [bench]: https://github.com/NMitchem/charpente/blob/main/docs/BENCH.md
 [plan]: https://github.com/NMitchem/charpente/blob/main/PLAN.md
 [manifesto]: https://github.com/NMitchem/charpente/blob/main/MANIFESTO.md
+[decisions]: https://github.com/NMitchem/charpente/blob/main/DECISIONS.md
 [invoicing]: https://github.com/NMitchem/charpente/tree/main/examples/invoicing
