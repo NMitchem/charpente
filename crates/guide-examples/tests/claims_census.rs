@@ -117,8 +117,13 @@ const EXEMPT: &[(&str, &str)] = &[
          (0.7.0 passes the same seed: demo.rs's the_seed_readme_quotes_from_0_6_0_now_passes); a \
          version, not a measurement",
     ),
+    (
+        "1.0",
+        "the first release whose data charpente carries across later releases (DECISIONS §15, \
+         §16); a version, not a measurement",
+    ),
 ];
-const EXEMPT_COUNT: usize = 14;
+const EXEMPT_COUNT: usize = 15;
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")

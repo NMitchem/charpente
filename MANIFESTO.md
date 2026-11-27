@@ -83,15 +83,19 @@ primitive with six services and duct tape.
 Charpente replaces the human review that no longer happens with machine verification:
 
 - **Compile-time contracts.** Tables, queries, routes, jobs, events and config are Rust
-  types. The type system is the oracle for the layer that has no torture suite: business
-  logic. An agent that breaks the schema contract gets a precise error, local to the change
-  and fixable, within seconds.
+  types. Business logic has no torture suite, and the type system is the oracle for its
+  shape: an agent that breaks a contract gets a precise compile error, local to the change
+  and fixable, within seconds. Types can't tell a right value from a wrong one, and a wrong
+  price is still a valid integer.
 - **Deterministic simulation.** The core is a deterministic state machine and all IO passes
   through swappable interfaces, so the entire application runs inside a simulator. Fault
   injection runs it through thousands of seeded universes per night, with crashes between
   any two writes, torn pages, partitions and clock skew. FoundationDB and TigerBeetle proved
   the technique finds the bugs that take a decade to surface in production. Charpente makes
   it the default for ordinary application code.
+- **Promises the builder can't edit.** The business states its promises as checks.
+  Charpente keeps those checks apart from the code the agent writes, names their version in
+  every verdict, and reports what no promise judged.
 - **Constraints as features.** Inside a transaction you can't await the network. That will
   feel alien if you expect Express-style "await anything anywhere," and it's deliberate:
   effects are explicit and ordered, so the simulator can run them. A programming model that
@@ -125,8 +129,11 @@ for that overwhelming majority.
   none of them can be switched off.
 - **A compatibility layer.** When charpente's own API or formats change, they change in
   place. The break shows up as a compile error or a named refusal that says what to do, and
-  an agent acts on that in seconds. A compatibility layer would mean running old and new
-  APIs side by side and migrating charpente's own stored formats between releases.
+  there are no parallel APIs. From 1.0, stored data is the exception. A format can still
+  change, but an app's data and its unfinished work cross every later charpente release,
+  and the simulator rehearses each upgrade on a copy of the data before the release ships.
+  An agent fixes a broken call in seconds, but yesterday's customers can't place their
+  orders again.
 
 ## 9. The wager
 
@@ -134,4 +141,5 @@ Charpente bets that within a few years most backends will be written by agents a
 by people, and that those people will choose platforms the way they once chose CI systems:
 by how reliably the machine catches the machine's mistakes. The framework that wins then
 will be the one that can tell a person: *every path through this system has been executed,
-under fault, thousands of times, and here is the seed to prove it.*
+under fault, thousands of times, and judged against promises its builder could not edit.
+Here is the seed to prove it, and here is what nothing judged.*
