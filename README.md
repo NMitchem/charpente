@@ -184,8 +184,9 @@ without reading it, and keep the business you already have. When an agent change
 where a mistake costs someone, you'll be able to accept the change from a verdict anyone can
 re-check, one that names which of your promises were checked and what nothing checked. The
 data and unfinished work your app stores from 1.0 on will cross every later charpente
-release. None of this is built yet. [PLAN.md][plan]'s 1.0 section has the stages that lead
-there, and [DECISIONS.md][decisions] §16 records the goal and what would reopen it.
+release, though APIs will still change in place. None of this is built yet.
+[PLAN.md][plan]'s 1.0 section has the stages that lead there, and [DECISIONS.md][decisions]
+§16 records the goal and what would reopen it.
 
 ## Limits
 
@@ -196,11 +197,11 @@ are on crates.io. These are the limits you'll hit first:
   it for reads and failover. There is no sharding, and there won't be ([DESIGN.md][design]
   §5). One machine's ceiling is its disk's durable write rate. [docs/BENCH.md][bench] has
   what has been measured, on a dev laptop only.
-- Until 1.0, a release can change charpente's own stored formats. When one does, a node
-  refuses a data directory, replication peer or archive written by another charpente minor,
-  by name, and never converts it. charpente carries your app's own data across your own
-  deploys. Data written by any release before 1.0, release candidates included, won't be
-  carried into 1.0 ([DECISIONS.md][decisions] §15).
+- Until 1.0, a release that changes charpente's own stored formats doesn't carry the old
+  data: a node refuses a data directory, replication peer or archive written by another
+  charpente minor, by name, and never converts it. charpente carries your app's own data
+  across your own deploys. Data written by any release before 1.0, release candidates
+  included, won't be carried into 1.0 ([DECISIONS.md][decisions] §15).
 - Apps are written in Rust, and there is no SQL interface: queries are typed Rust calls. charpente
   can generate a TypeScript client for the front end ([docs/GUIDE.md][guide] §14).
 - The simulator drives your app's kernel, not its socket. The HTTP server (`charpente::serve`,

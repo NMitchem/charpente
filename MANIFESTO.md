@@ -93,9 +93,9 @@ Charpente replaces the human review that no longer happens with machine verifica
   any two writes, torn pages, partitions and clock skew. FoundationDB and TigerBeetle proved
   the technique finds the bugs that take a decade to surface in production. Charpente makes
   it the default for ordinary application code.
-- **Promises the builder can't edit.** Charpente is building this for 1.0. The business
-  states its promises as checks, and charpente keeps those checks apart from the code the
-  agent writes, names their version in every verdict, and reports what no promise judged.
+- **Promises the builder can't edit.** Planned for 1.0. The business will state its
+  promises as checks, and charpente will keep those checks apart from the code the agent
+  writes, name their version in every verdict, and report what no promise judged.
 - **Constraints as features.** Inside a transaction you can't await the network. That will
   feel alien if you expect Express-style "await anything anywhere," and it's deliberate:
   effects are explicit and ordered, so the simulator can run them. A programming model that
@@ -130,10 +130,10 @@ for that overwhelming majority.
 - **A compatibility layer.** When charpente's own API or formats change, they change in
   place. The break shows up as a compile error or a named refusal that says what to do, and
   there are no parallel APIs. From 1.0, stored data is the exception. A format can still
-  change, but an app's data and its unfinished work cross every later charpente release,
-  and the simulator rehearses each upgrade on a copy of the data before the release ships.
-  An agent fixes a broken call in seconds, but yesterday's customers can't place their
-  orders again.
+  change, but the data and unfinished work an app stores from 1.0 on will cross every
+  later charpente release, and the simulator will rehearse each upgrade on snapshots
+  before the release ships. An agent fixes a broken call in seconds, but yesterday's
+  customers can't place their orders again.
 
 ## 9. The wager
 
@@ -142,4 +142,4 @@ by people, and that those people will choose platforms the way they once chose C
 by how reliably the machine catches the machine's mistakes. The framework that wins then
 will be the one that can tell a person: *every path through this system has been executed,
 under fault, thousands of times. Here is the seed to prove it, what was judged against
-promises its builder could not edit, and what no promise covers.*
+promises its builder could not edit, and what no promise judged.*
