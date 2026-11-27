@@ -222,7 +222,7 @@ are on crates.io. These are the limits you'll hit first:
 |---|---|
 | [MANIFESTO.md][manifesto] | Why this exists: the agent-era argument |
 | [DESIGN.md][design] | Architecture: the deterministic core, write model, typed surface, simulation |
-| [PLAN.md][plan] | Milestones (M0 through M3), what waits until after launch, risks, non-goals |
+| [PLAN.md][plan] | Milestones (M0 through M3, then 1.0), what waits until after launch, risks, non-goals |
 | [docs/GUIDE.md][guide] | How to build an app, written for agents first, with every runnable example compile-gated |
 | [docs/BENCH.md][bench] | Measured numbers, method first, on dev hardware |
 | [examples/invoicing][invoicing] | The M0 demo, built by an agent from the docs alone (DEMO.md and FINDINGS.md) |
