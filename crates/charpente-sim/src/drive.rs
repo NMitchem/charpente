@@ -29,7 +29,8 @@ use charpente::kernel::{Kernel, SimSource};
 
 use crate::Sim;
 use crate::checks::{
-    boot_through_fallout, clock_fallout, is_fault_fallout, mark_dead_coverage,
+    boot_through_fallout, calls_have_durable_jobs, clock_fallout, dead_hooks_succeeded,
+    durable_corruption_fired, is_fault_fallout, keys_are_per_effect, mark_dead_coverage,
     wait_out_clock_refusal,
 };
 use crate::outbound::no_model;
@@ -275,12 +276,22 @@ impl<'s> Drive<'s> {
     ///   outbound row and is never extended. [`Recovered::extensions`] counts
     ///   the extensions, and [`Recovered::wall`] is the wall time it stopped
     ///   at, what `checks::outbound_settles_by_horizon` judges at.
+    /// - **Checks.** Then, on one snapshot of the tail's store, it runs
+    ///   [`keys_are_per_effect`], [`calls_have_durable_jobs`] and
+    ///   [`dead_hooks_succeeded`], in that order, for every app, and fails
+    ///   the run on the first that fails, in its words. A call that reached
+    ///   a remote with no durable job, where [`durable_corruption_fired`],
+    ///   gives the run up instead: one sim box's only loss window is media
+    ///   corruption, which can cut an enqueue whose call was already made.
     /// - **Coverage.** Last, [`mark_dead_coverage`] marks `dead:<job>` once
     ///   per Dead row, for every app, so its sim can `require:` that a job's
     ///   Dead path ran.
     ///
     /// `Ok(None)`: the run gave up, on a boot refused for durable corruption
-    /// where it fired (`boot_through_fallout`), and on nothing else. The
+    /// where it fired (`boot_through_fallout`), or on a call that reached a
+    /// remote with no durable job where durable corruption fired, under
+    /// `injected corruption cut an enqueue after its call reached the
+    /// remote` with the check's text as its detail, and on nothing else. The
     /// give-up is named on `sim`; the caller returns `Ok(())`.
     ///
     /// # Errors
@@ -316,6 +327,17 @@ impl<'s> Drive<'s> {
     ///   reaches its next attempt; give the job a retry policy that ends, a
     ///   retry(max = …) small enough that it reaches Dead`, naming the job due
     ///   last.
+    /// - A key that carries two requests, or two jobs under one key neither
+    ///   of which is Dead: [`keys_are_per_effect`]'s text, `keys_are_per_effect:
+    ///   jobs <a> and <b> carry the same idempotency key <key> …`, unchanged.
+    /// - A call that reached a remote with a key no job in the store carries,
+    ///   where no durable corruption fired: [`calls_have_durable_jobs`]'s
+    ///   text, `calls_have_durable_jobs: a call to <host> with key <key>
+    ///   reached the remote at <at>ns, but no job in the recovered store
+    ///   carries that key …`, unchanged.
+    /// - A Dead job whose `on_dead` hook failed: [`dead_hooks_succeeded`]'s
+    ///   text, `dead_hooks_succeeded: job <id> ("<name>") is Dead and its
+    ///   on_dead hook failed: …`, unchanged.
     /// - A failed read of the store, after a run, in the store's words.
     /// - An app that declares a host the workload registered no model for:
     ///   the missing-remote text [`Drive::faulted_phase`] gives.
@@ -411,6 +433,19 @@ impl<'s> Drive<'s> {
             let mut source = SimSource::new(Box::new(sim.clock()), horizon);
             kernel.run(&mut source).map_err(stopped)?;
         };
+        let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
+        keys_are_per_effect(&snap)?;
+        if let Err(e) = calls_have_durable_jobs(sim, &snap) {
+            if durable_corruption_fired(sim) {
+                sim.give_up(
+                    "injected corruption cut an enqueue after its call reached the remote",
+                    e,
+                );
+                return Ok(None);
+            }
+            return Err(e);
+        }
+        dead_hooks_succeeded(&snap)?;
         mark_dead_coverage(sim, kernel.app())?;
         let mut resent = vec![None; phase.requests.len()];
         let answers = answers

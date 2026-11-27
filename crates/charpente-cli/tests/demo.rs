@@ -43,7 +43,7 @@ const GOLDEN: &str = r"
 skipped runs hit an injected fault before reaching the check, so they prove nothing either way:
   each_order_is_charged_once
     7  the boot was refused: injected corruption reached durable data at or below the store's horizon, which no restart clears, so nothing past it was adjudicated (first: --seed 0xe89246396f6a95eb)
-    1  injected corruption cut an enqueue after its call reached the gateway (first: --seed 0x11c23979e56d3608)
+    1  injected corruption cut an enqueue after its call reached the remote (first: --seed 0x11c23979e56d3608)
 
 check each_order_is_charged_once ... ok  (248 tested over 49 distinct inputs, 8 skipped)
 

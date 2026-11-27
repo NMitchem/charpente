@@ -2359,7 +2359,10 @@ Charpente treats the coding agent as the primary developer persona:
   time, or none once it is due) and the drawn outage's remaining length, plus its job's
   declared timeout, plus 1 s. That way a retry's wait or an outage costs a wake-up.
   `TAIL_SETTLE_CAP` (256) extensions with work still due fail the run by name.
-  `Drive::recover` calls `mark_dead_coverage` last (0.5.0 spec §5 E). Exit code 0 is
+  After its tail, `Drive::recover` runs `keys_are_per_effect`, `calls_have_durable_jobs`
+  and `dead_hooks_succeeded` on the tail's store and fails the run on the first that
+  fails, in its words; a call with no durable job where durable corruption fired gives
+  the run up instead. It calls `mark_dead_coverage` last (0.5.0 spec §5 E). Exit code 0 is
   green. Exit code 1 means sim failures, unmet coverage, or a check that tested nothing
   (every run skipped: a vacuous check fails the batch, and a `--seed` replay of a skipped
   run exits 0). Exit code 2 is a build/usage/infrastructure error. The platform's own

@@ -3949,8 +3949,24 @@ that limit the run fails at once, by its own text naming the job's due time
 (below), rather than at the end of the u64 nanosecond range, where the kernel
 stops on its daily sweep's overflow. An app with no host has no outbound row,
 so it is never extended. `recovered.extensions` counts the extensions, and
-`recovered.wall` is the wall time the tail stopped at, the time to pass
-`outbound_settles_by_horizon` ("The checkers", below).
+`recovered.wall` is the wall time the tail stopped at.
+
+**The platform's rules, checked after the tail.** Once the tail settles,
+`recover` reads one snapshot of the tail's store and runs three of "The
+checkers" (below) on it, in this order: `keys_are_per_effect`,
+`calls_have_durable_jobs` and `dead_hooks_succeeded`. The first that fails is
+`recover`'s `Err`, in the check's own words, which name the rule, so a `Drive`
+workload calls none of them and cannot skip one. One failure is not the app's
+to fix: a call that reached a remote with no durable job behind it, in a run
+where durable corruption fired (`durable_corruption_fired`), since a bit flip
+can cut an enqueue whose call was already made. `recover` gives that run up,
+with the check's text as the give-up's detail, and returns `Ok(None)`, under
+this reason:
+
+<!-- pinned -->
+```text
+injected corruption cut an enqueue after its call reached the remote
+```
 
 **Coverage for a Dead path.** Last, `recover` calls `mark_dead_coverage`
 ("The checkers"), which marks `dead:<job>` once per Dead row, whatever the
@@ -4457,26 +4473,31 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   that never became durable. It attributes a call by `OutboundCall::key`,
   never by where the app put the key in the request. One sim box has one loss
   window, media corruption: a bit flip can cut an acknowledged enqueue whose
-  call was already made, and then this check fails. Route a failure through
-  `durable_corruption_fired` and give the run up where it fired, never
-  pass it, the same rule as any acked-durability shortfall.
+  call was already made, and then this check fails. Such a failure gives the
+  run up where durable corruption fired, never passes it, the same rule as
+  any acked-durability shortfall. `Drive::recover` runs it after the tail,
+  and gives that run up itself; a hand driver calls it, and routes a failure
+  through `durable_corruption_fired`.
 - `keys_are_per_effect(snap: &Snapshot) -> Result<(), String>` — a key carries
   exactly one request. Every row that holds one has the same name and the same
   payload bytes, and at most one of them is not Dead: only a re-issue from
   `on_dead` copies a key, together with its request, and the row it copies is Dead
   by then. It fails wherever a key carries two requests, or two jobs that are not
   Dead, which would send the effect twice. The error names both jobs and the key, and what differs.
+  `Drive::recover` runs it after the tail; a hand driver calls it.
 - `outbound_settles_by_horizon(snap: &Snapshot, at: WallTime) -> Result<(), String>`
-  — every outbound job due at `at` is Done or Dead. `at` is the wall time
-  the tail ended at: `recovered.wall` after `Drive::recover` (the greater of
-  the clock's reading and the kernel's held wall), or `sim.clock().wall()`
-  read after a hand driver's last run. A Pending row with
-  no attempt made and a due time after `at` is not judged, since it is not yet
-  due: a delayed job (§6) or a re-issue scheduled later. Every other Pending
-  outbound row fails it, the first by id, as lost by the kernel: one due and
-  never attempted, or a retry the tail did not run past. Call it only after
-  the tail: `sim.quiesce_disk_faults()`, `sim.quiesce_outbound_faults()`, and
-  a run until the outbound work settles ("A fault-free tail", above).
+  — every outbound job due at `at` is Done or Dead. It is for a hand driver:
+  `Drive::recover` returns only once no outbound row it would judge is left
+  at `recovered.wall` (the greater of the clock's reading and the kernel's
+  held wall), so after `recover` it cannot fail. `at` is the wall time the
+  tail ended at, `sim.clock().wall()` read after the hand driver's last run.
+  A Pending row with no attempt made and a due time after `at` is not judged,
+  since it is not yet due: a delayed job (§6) or a re-issue scheduled later.
+  Every other Pending outbound row fails it, the first by id, as lost by the
+  kernel: one due and never attempted, or a retry the tail did not run past.
+  Call it only after the tail: `sim.quiesce_disk_faults()`,
+  `sim.quiesce_outbound_faults()`, and a run until the outbound work settles
+  ("A fault-free tail", above).
 - `mark_dead_coverage(sim: &Sim, app: &App) -> Result<(), String>` — marks
   `dead:<job>` once per Dead row in `app`'s store, whatever the job's stance,
   so a sim can `require:` that a job's Dead path ran. `Drive::recover` calls
@@ -4494,9 +4515,10 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   by id. The prefix is in the row, so it survives the drive's kernel swap and
   every restart, as a counter in memory would not, and an app's own text that
   begins with it is stored behind `job error: `, so app text neither trips the
-  check nor hides a failure from it. Call it on the recovered store at the end of
-  a run, beside the other end-state checks. A hook's `Err(JobError::App)`, panic
-  or refused transaction is the app's own deterministic bug, so a run in which
+  check nor hides a failure from it. `Drive::recover` runs it after the tail; a
+  hand driver calls it, on the recovered store at the end of a run, beside the
+  other end-state checks. A hook's `Err(JobError::App)`, panic or refused
+  transaction is the app's own deterministic bug, so a run in which
   one happened fails, and never gives up. A hook's other `Err(JobError::Io)` is
   not a failure: nothing commits, the job runs again, and no prefix is written.
   `charpente new`'s scaffold calls it in its echo property, where it passes

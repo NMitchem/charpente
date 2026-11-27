@@ -630,8 +630,10 @@ fn read_events<E: Event>(
 /// recovered store (outbound-effects spec §10): a call never fires for an
 /// enqueue that is not durable. Single-node. One sim box's only loss window is
 /// media corruption: where [`durable_corruption_fired`], a cut enqueue whose
-/// call was already made fails this check, so a workload routes a failure
-/// through that and gives the universe up, never passes it. Attributes by
+/// call was already made fails this check, so such a failure gives the
+/// universe up, never passes it. `Drive::recover` runs it after the tail and
+/// gives such a universe up itself; a hand driver routes a failure through
+/// [`durable_corruption_fired`] and gives it up. Attributes by
 /// `OutboundCall::key`, never by where the app put the key.
 pub fn calls_have_durable_jobs(sim: &Sim, snap: &Snapshot) -> Result<(), String> {
     let keys: BTreeSet<[u8; 16]> = snap

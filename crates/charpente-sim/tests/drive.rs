@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use charpente::auth::ApiKey;
 use charpente::core::io::{
-    Clock, Disk, File, HttpMethod, IdempotencyKey as CallKey, Outbound, OutboundCall,
+    Clock, Disk, Entropy, File, HttpMethod, IdempotencyKey as CallKey, Outbound, OutboundCall,
     OutboundReply, WallTime,
 };
 use charpente::core::job::{JobRow, JobStatus};
@@ -2324,4 +2324,228 @@ fn faulted_phase_stamps_each_write_before_the_boot_and_leaves_gets_and_named_ids
         "a second Sim on the seed stamps the same ids"
     );
     assert_ne!(stamped(0xD7_0001).2[0], keys[0], "another seed, other ids");
+}
+
+// `recover` runs the platform's checks after the tail: `keys_are_per_effect`,
+// `calls_have_durable_jobs` and `dead_hooks_succeeded`. Each test below breaks
+// one rule with no fault drawn, so the seed only names the universe, and calls
+// no check itself: the failure comes through `recover` alone.
+
+/// Returns the same bytes on every draw, so every key an app mints from it is
+/// `0707…07`.
+struct Constant;
+
+impl Entropy for Constant {
+    fn fill(&self, buf: &mut [u8]) {
+        buf.fill(7);
+    }
+}
+
+/// Two mails, for the note and the next one, in one transaction.
+#[route(POST "/pair/:id", public)]
+fn send_pair(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue(Mail { note: id });
+    tx.enqueue(Mail {
+        note: Id::from_raw(id.raw() + 1),
+    });
+    Ok(id)
+}
+
+/// `mailer` opened on `Constant`: the route's two enqueues mint one key.
+fn constant_mailer(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(Constant),
+        AppConfig::default(),
+    )?
+    .mount(routes![send_pair])
+    .mount_jobs(jobs![Mail])
+    .outbound(Host::new("mail.example")))
+}
+
+/// Two outbound jobs minted under one key: the app opens on an entropy that
+/// returns the same bytes every draw, so the route's two enqueues share a key.
+#[test]
+fn recover_fails_a_run_whose_two_jobs_share_a_key() {
+    // 0xD7_0C00 with no faults: the case is built by the entropy.
+    let sim = Sim::with_faults(0xD7_0C00, FaultConfig::none());
+    sim.remote("mail.example", Counting(Arc::new(AtomicU64::new(0))));
+    let drive = Drive::new(&sim, constant_mailer);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/pair/1"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let err = drive
+        .recover(&phase, Duration::from_secs(60))
+        .err()
+        .expect("the check fails the run");
+    assert!(
+        err.starts_with(
+            "keys_are_per_effect: jobs 0 and 1 carry the same idempotency key \
+             07070707070707070707070707070707"
+        ),
+        "{err}"
+    );
+}
+
+/// The notes app, after its phase, with a call to `mail.example` under key
+/// `0909…09` that no job carries, started by hand on the run's sim.
+fn orphan_call(sim: &Sim) -> (Drive<'_>, Phase) {
+    sim.remote("mail.example", Counting(Arc::new(AtomicU64::new(0))));
+    let drive = Drive::new(sim, notes);
+    let phase = drive
+        .faulted_phase(&posts(&[1]), Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    sim.outbound(&["mail.example"])
+        .unwrap()
+        .start(
+            0,
+            OutboundCall {
+                host: "mail.example",
+                method: HttpMethod::Post,
+                path: "/x".into(),
+                headers: vec![],
+                body: vec![],
+                key: CallKey::from_bytes([9; 16]),
+            },
+        )
+        .unwrap();
+    (drive, phase)
+}
+
+/// A call reached the remote with a key no job in the store carries.
+#[test]
+fn recover_fails_a_run_whose_call_has_no_durable_job() {
+    // 0xD7_0C01 with no faults: the orphan call is built by hand.
+    let sim = Sim::with_faults(0xD7_0C01, FaultConfig::none());
+    let (drive, phase) = orphan_call(&sim);
+    let err = drive
+        .recover(&phase, Duration::from_secs(1))
+        .err()
+        .expect("the check fails the run");
+    assert!(
+        err.starts_with(
+            "calls_have_durable_jobs: a call to mail.example with key \
+             09090909090909090909090909090909 reached the remote"
+        ),
+        "{err}"
+    );
+    assert_eq!(
+        sim.gave_up(),
+        None,
+        "no corruption fired, so nothing excuses it"
+    );
+}
+
+/// The same orphan call where durable corruption is marked as fired: given up,
+/// not failed. Constructed: `sim.cover("fault:bit_flip")` stands in for a bit
+/// flip that cut the enqueue; the natural seed is the double-charge GOLDEN's
+/// 0x11c23979e56d3608.
+#[test]
+fn recover_gives_up_an_orphan_call_where_corruption_fired() {
+    // 0xD7_0C02 with no faults: the orphan call and the corruption mark are
+    // built by hand.
+    let sim = Sim::with_faults(0xD7_0C02, FaultConfig::none());
+    let (drive, phase) = orphan_call(&sim);
+    sim.cover("fault:bit_flip");
+    assert!(
+        drive
+            .recover(&phase, Duration::from_secs(1))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        sim.gave_up(),
+        Some("injected corruption cut an enqueue after its call reached the remote")
+    );
+    assert!(
+        sim.gave_up_detail().is_some_and(|d| d.starts_with(
+            "calls_have_durable_jobs: a call to mail.example with key \
+             09090909090909090909090909090909 reached the remote"
+        )),
+        "the give-up carries the check's text: {:?}",
+        sim.gave_up_detail()
+    );
+}
+
+/// Refused by its host, so its one attempt sends it to Dead, and its hook
+/// fails: the Dead mark commits alone.
+#[job(global, on_dead, outbound = "hapless.test", retry(max = 1))]
+struct Hapless {
+    note: Id<Note>,
+}
+
+impl Hapless {
+    fn call(&self, _tx: &Tx, _key: &IdempotencyKey) -> Result<Option<Call>, JobError> {
+        Ok(Some(Call::post("/x")))
+    }
+
+    fn settle(self, _tx: &mut Tx, reply: Reply) -> Result<(), JobError> {
+        match reply.status() {
+            200 => Ok(()),
+            _ => Err(JobError::app("hapless.test refused")),
+        }
+    }
+
+    fn on_dead(self, _tx: &mut Tx, _dead: charpente::Dead<Self>) -> Result<(), JobError> {
+        Err(JobError::app("the hook gave up"))
+    }
+}
+
+#[route(POST "/hapless/:id", public)]
+fn start_hapless(tx: &mut Tx, id: Id<Note>) -> Result<Id<Note>, ApiError> {
+    tx.enqueue(Hapless { note: id });
+    Ok(id)
+}
+
+fn hapless_app(sim: &Sim) -> io::Result<App> {
+    Ok(App::open(
+        Box::new(sim.disk()),
+        Schema::new().table::<Note>(),
+        Box::new(sim.entropy()),
+        AppConfig::default(),
+    )?
+    .mount(routes![start_hapless])
+    .mount_jobs(jobs![Hapless])
+    .outbound(Host::new("hapless.test")))
+}
+
+/// An on_dead hook that returns Err: the Dead mark commits alone and the run
+/// fails.
+#[test]
+fn recover_fails_a_run_whose_dead_hook_failed() {
+    // 0xD7_0C03 with no faults: the host refuses every call and the hook
+    // fails, by the app's own code.
+    let sim = Sim::with_faults(0xD7_0C03, FaultConfig::none());
+    sim.remote(
+        "hapless.test",
+        charpente_sim::outbound::from_fn(|_: &OutboundCall| OutboundReply {
+            status: 503,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }),
+    );
+    let drive = Drive::new(&sim, hapless_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/hapless/1"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    let err = drive
+        .recover(&phase, Duration::from_secs(60))
+        .err()
+        .expect("the check fails the run");
+    assert!(
+        err.starts_with(
+            "dead_hooks_succeeded: job 0 (\"Hapless\") is Dead and its on_dead hook failed"
+        ),
+        "{err}"
+    );
 }

@@ -77,8 +77,9 @@ use std::path::{Path, PathBuf};
 /// `outbound_settles_by_horizon`'s failure and the hand-built `JobDef`'s
 /// Dead coverage refusal (2026-11-19); 61 with the tail's 2262 limit
 /// (2026-11-19); 62 with a write route's intent-id answers (2026-11-25); 63
-/// with `#[route]`'s `intent = header(...)` refusals (2026-11-25).
-const PINNED_FLOOR: usize = 63;
+/// with `#[route]`'s `intent = header(...)` refusals (2026-11-25); 64 with
+/// `Drive::recover`'s corruption give-up (2026-11-26).
+const PINNED_FLOOR: usize = 64;
 
 /// Below this a fragment is not evidence — `usage:` or `id: 1.0` would match
 /// almost any corpus. Long enough that a coincidental hit is implausible,
