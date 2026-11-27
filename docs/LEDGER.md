@@ -10008,3 +10008,89 @@ The tags are annotated (`charpente <version>`). `v0.6.0` carries the GitHub rele
   - docs/BENCH.md's wire numbers predate intent rows. Each keyed write now writes a record and an index entry, so the wire write path and the sweep over a large table need measuring before any 0.7.0 figure is quoted.
   - The publish. The double-charge example's `Cargo.lock` needs refreshing from the published crates, as 0.6.0's Task 8 did.
   - The twin's re-spike on top of this step (worktree `charpente-twin-spike`, uncommitted). Its design doc §12 lists seven open questions.
+
+## 2026-11-26 — Drive::recover runs the platform checks (0.7.0, unreleased), built
+
+Spec: `docs/superpowers/specs/2026-11-26-drive-runs-platform-checks-design.md`, approved by
+Noah the same day. Plan commit `0fa8aa90`.
+
+- **Why:** the 2026-11-26 twin review parked the fault-free twin and named this as the
+  cheaper step that comes first. Before it, `examples/double-charge/tests/sim.rs` spent
+  twelve lines calling `keys_are_per_effect`, `outbound_settles_by_horizon` and
+  `calls_have_durable_jobs` and routing a durable-corruption give-up. An app that forgot
+  them got no verdict on those rules.
+- **What landed**, four commits on `main`, `0fa8aa90..d07debf9`:
+  - `45fda649`: after the tail, `Drive::recover` takes one snapshot and runs
+    `keys_are_per_effect`, `calls_have_durable_jobs` and `dead_hooks_succeeded`, then
+    `mark_dead_coverage` last. When `calls_have_durable_jobs` fails and durable corruption
+    fired, the universe is given up with the reason `injected corruption cut an enqueue
+    after its call reached the remote`; otherwise the check's own text comes back as `Err`.
+    Four tests in `crates/charpente-sim/tests/drive.rs`, a GUIDE §8 paragraph with a pinned
+    block, the CHANGELOG bullet, DESIGN and the `checks.rs` doc.
+  - `0e03658b`: GUIDE §8's summary of what `recover` returns now names the corruption-orphan
+    give-up and the three failing checks.
+  - `b3cd5eea`: deleted the copies `recover` makes redundant, in
+    `examples/double-charge/tests/sim.rs`, `crates/charpente/examples/modelled_remote.rs`,
+    the GUIDE §8 example and `crates/charpente-cli/templates/sim.rs.tmpl`; rewrote the
+    prose and the rustdoc that pointed at them (7 files, 21 insertions, 63 deletions).
+  - `d07debf9`: GUIDE's `dead_hooks_succeeded` entry no longer says the scaffold calls it.
+- **`outbound_settles_by_horizon` is not added, and its copies after `recover` are
+  deleted.** `recover` returns only once no row the check would judge is left at
+  `recovered.wall`, so after `recover` it cannot fail. It stays for hand drivers.
+- **Red results (Task 1 Step 5):** each mutation of `drive.rs` was judged by the whole
+  `charpente-sim` suite.
+  - Drop `keys_are_per_effect`: red is `recover_fails_a_run_whose_two_jobs_share_a_key`, alone.
+  - Drop the `calls_have_durable_jobs` block: red is `recover_fails_a_run_whose_call_has_no_durable_job`
+    and `recover_gives_up_an_orphan_call_where_corruption_fired`.
+  - Force the corruption branch off (always `Err`): red is the give-up test alone.
+  - Drop `dead_hooks_succeeded`: red is `recover_fails_a_run_whose_dead_hook_failed`, alone.
+  - No other test went red under any of them, and none left the suite green.
+- **GOLDEN:** one line moved in `crates/charpente-cli/tests/demo.rs` (and README), "reached
+  the gateway" to "reached the remote". Its count (1) and first seed
+  (`0x11c23979e56d3608`) did not change, nor did any other GOLDEN line. The app's own text
+  still says "gateway"; the batch prints "remote" only because `recover` gives the universe
+  up first.
+- **Evidence at `d07debf9`:**
+  - fmt and clippy `-D warnings` are clean. The workspace suite passes 109 of 109 binaries
+    (106 `test result: ok`, 3 `sim result: ok`; 2417 passed, 0 failed, 66 ignored), the same
+    109 as at `0883dcdb`. `charpente-cli --test demo` (the double-charge patched copy, its
+    GOLDEN and the other-master-seeds test) passes 10 of 10. `--test new` (the scaffold)
+    passes 20, 1 ignored. The edge rig passes 11 of 11 binaries, 47 tests. Logs:
+    `.superpowers/sdd/2026-11-26-drive-runs-platform-checks/evidence/` (`summary.md`).
+  - Fresh master seed `0x31c46d1f0d632cc2`, `--runs 500`, exit 0, every check passed:
+
+    | Batch | Checks | Tested runs, in order |
+    |---|---|---|
+    | sim-fixture | 6 of 6 | 409, 500, 483, 437, 431, 500 |
+    | invoicing | 7 of 7 | 252, 500, 216, 177, 500, 500, 232 |
+    | outbound-fixture | 1 of 1 | 484 |
+    | a fresh `charpente new` scaffold | 4 of 4 | 422, 495, 400, 498 |
+    | example `modelled_remote` | 1 of 1 | 471 |
+    | example `drawn_inputs` | 1 of 1 | 495 |
+    | example `restart_under_faults` | 1 of 1 | 423 |
+
+  - The new give-up reason fired in `modelled_remote`, 5 runs (first seed
+    `0xe6eaecc69430c272`). That is the only batch where `Drive` hit it. outbound-fixture's
+    batch, which drives recovery by hand, listed 2 runs under its own older wording,
+    `durable corruption cut an enqueue whose call had already reached the remote`.
+  - The scaffold was built the way `sim-nightly.yml` does, with the two `[patch.crates-io]`
+    lines. It sat inside this checkout's tree, so cargo took it for a workspace member and
+    refused (exit 2, nothing ran); an empty `[workspace]` table in the scratch manifest fixed
+    that, and the batch above is the rerun. CI builds it outside the tree and needs neither.
+- **Calls the controller made** (Noah may rework them). Each says what it costs if wrong.
+  - R1: Task 1 also updated DESIGN.md, the `calls_have_durable_jobs` rustdoc and GUIDE's
+    `recovered.wall` sentence, since hard rule 6 wants docs in the behaviour's commit. Cost:
+    three extra doc lines a reviewer may call scope creep.
+  - R2: Task 1's expected red sets were fixed up front, one test each, except two for the
+    orphan-call mutation. Cost: nothing, it is the arithmetic of the tests.
+  - R3: Task 2 rewrote the scaffold template's comment to say `recover` already fails a run
+    whose `on_dead` hook failed, rather than leave a doc describing a deleted call. Cost: one
+    doc comment.
+  - R4: Task 2 also rewrote GUIDE's `dead_hooks_succeeded` entry and the three rustdoc spots
+    that sent a `Drive` user to `outbound_settles_by_horizon`. Cost: Task 1's commit carries
+    three stale doc lines for one commit.
+  - R5: Task 3 also ran the three shipped sim examples, because `cargo test` runs 0 tests
+    for them and `modelled_remote` uses `Drive`. Cost: three extra batch runs.
+  - R6: the controller ran Task 3 Step 1 (fmt, clippy, workspace suite, edge rig) itself and
+    the subagent ran the seed batches, since the suite can pass the 600 s tool limit and a
+    backgrounded subagent run stalls. Cost: a few count lines in controller context.

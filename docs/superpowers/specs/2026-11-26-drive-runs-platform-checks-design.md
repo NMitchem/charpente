@@ -1,6 +1,6 @@
 # `Drive::recover` runs the platform checks
 
-Status: approved by Noah, 2026-11-26. A small change, so this is the short design. It ships
+Status: built 2026-11-26 (LEDGER 2026-11-26); approved by Noah, 2026-11-26. A small change, so this is the short design. It ships
 in 0.7.0, before the publish.
 
 ## Why
