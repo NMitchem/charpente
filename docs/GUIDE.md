@@ -4527,10 +4527,9 @@ refusal. Reach for these before hand-rolling the same logic a fourth time:
   transaction is the app's own deterministic bug, so a run in which
   one happened fails, and never gives up. A hook's other `Err(JobError::Io)` is
   not a failure: nothing commits, the job runs again, and no prefix is written.
-  `charpente new`'s scaffold calls it in its echo property, where it passes
-  trivially until a job declares `on_dead`; from then on it fails any run in which
-  that hook failed. Its failure names the job and quotes what
-  follows the prefix, the hook's error and then the job's (below).
+  A scaffold job with no hook passes it trivially. Its failure names the job
+  and quotes what follows the prefix, the hook's error and then the job's
+  (below).
 - `events::<E: Event>(snap: &Snapshot) -> Result<Vec<E>, String>` and
   `events_scoped::<E: Event>(snap: &Snapshot, tenant: u64) -> Result<Vec<E>, String>
   where E::Scope: Tenant` — the durable event log read as your own event
