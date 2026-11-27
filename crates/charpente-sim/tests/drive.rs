@@ -2549,3 +2549,64 @@ fn recover_fails_a_run_whose_dead_hook_failed() {
         "{err}"
     );
 }
+
+/// A Dead job whose hook failed, and an orphan call where durable corruption
+/// is marked as fired, in one run: the failure outranks the give-up, so the
+/// run fails and is not given up. Constructed, as the give-up test above is.
+#[test]
+fn recover_fails_a_failed_hook_where_an_orphan_call_would_give_up() {
+    // 0xD7_0C04 with no faults: the host refuses every call and the hook
+    // fails, by the app's own code; the orphan call and the corruption mark
+    // are built by hand.
+    let sim = Sim::with_faults(0xD7_0C04, FaultConfig::none());
+    sim.remote(
+        "hapless.test",
+        charpente_sim::outbound::from_fn(|_: &OutboundCall| OutboundReply {
+            status: 503,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }),
+    );
+    let drive = Drive::new(&sim, hapless_app);
+    let phase = drive
+        .faulted_phase(
+            &[(Duration::ZERO, Request::new(Method::Post, "/hapless/1"))],
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert_eq!(phase.status(0), Some(200));
+    sim.outbound(&["hapless.test"])
+        .unwrap()
+        .start(
+            0,
+            OutboundCall {
+                host: "hapless.test",
+                method: HttpMethod::Post,
+                path: "/x".into(),
+                headers: vec![],
+                body: vec![],
+                key: CallKey::from_bytes([9; 16]),
+            },
+        )
+        .unwrap();
+    sim.cover("fault:bit_flip");
+    let err = drive
+        .recover(&phase, Duration::from_secs(60))
+        .err()
+        .expect("the failed hook fails the run");
+    assert!(
+        err.starts_with(
+            "dead_hooks_succeeded: job 0 (\"Hapless\") is Dead and its on_dead hook failed"
+        ),
+        "{err}"
+    );
+    assert_eq!(sim.gave_up(), None, "a failure outranks a give-up");
+    assert!(
+        durable_corruption_fired(&sim)
+            && sim
+                .outbound_deliveries()
+                .iter()
+                .any(|d| d.key.as_bytes() == &[9; 16]),
+        "the give-up's case held: the orphan call reached the remote where corruption fired"
+    );
+}

@@ -3959,9 +3959,10 @@ checkers" (below) on it, in this order: `keys_are_per_effect`,
 workload calls none of them and cannot skip one. One failure is not the app's
 to fix: a call that reached a remote with no durable job behind it, in a run
 where durable corruption fired (`durable_corruption_fired`), since a bit flip
-can cut an enqueue whose call was already made. `recover` gives that run up,
-with the check's text as the give-up's detail, and returns `Ok(None)`, under
-this reason:
+can cut an enqueue whose call was already made. A failure outranks a give-up,
+so `recover` runs `dead_hooks_succeeded` first and fails the run if a hook
+failed. Otherwise it gives the run up, with the check's text as the give-up's
+detail, and returns `Ok(None)`, under this reason:
 
 <!-- pinned -->
 ```text
@@ -4052,9 +4053,9 @@ the node.
 
 `recover` gives `Ok(None)` when the run gave up by name, on a boot refused for
 durable corruption, or on a call that reached a remote with no durable job
-where durable corruption fired ("The platform's rules, checked after the
-tail", above), and on nothing else. Return `Ok(())` then. Its errors fail the
-run:
+where durable corruption fired and no `on_dead` hook failed ("The platform's
+rules, checked after the tail", above), and on nothing else. Return `Ok(())`
+then. Its errors fail the run:
 
 - `the fault-free tail could not boot`: every boot met fault fallout, and
   nothing gave the run up.
@@ -4097,7 +4098,8 @@ Drive::recover: outbound job <id> ("<name>") is still Pending at attempt <a>, du
 
 - A failing platform check, in its own words: `keys_are_per_effect: …`,
   `calls_have_durable_jobs: …` or `dead_hooks_succeeded: …` ("The checkers",
-  below).
+  below). A failed hook fails the run even where a call with no durable job
+  would have given it up: a failure outranks a give-up.
 
 **When to drop below the helper.** `Drive` is one faulted phase and one tail.
 A workload with more than that builds it from the pieces this section and

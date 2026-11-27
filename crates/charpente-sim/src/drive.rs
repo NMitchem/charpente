@@ -285,16 +285,20 @@ impl<'s> Drive<'s> {
     ///   a remote with no durable job, where [`durable_corruption_fired`],
     ///   gives the run up instead: one sim box's only loss window is media
     ///   corruption, which can cut an enqueue whose call was already made.
+    ///   A failure outranks a give-up, so it gives that run up only once
+    ///   [`dead_hooks_succeeded`] has passed, and a run whose hook failed as
+    ///   well fails.
     /// - **Coverage.** Last, [`mark_dead_coverage`] marks `dead:<job>` once
     ///   per Dead row, for every app, so its sim can `require:` that a job's
     ///   Dead path ran.
     ///
     /// `Ok(None)`: the run gave up, on a boot refused for durable corruption
     /// where it fired (`boot_through_fallout`), or on a call that reached a
-    /// remote with no durable job where durable corruption fired, under
-    /// `injected corruption cut an enqueue after its call reached the
-    /// remote` with the check's text as its detail, and on nothing else. The
-    /// give-up is named on `sim`; the caller returns `Ok(())`.
+    /// remote with no durable job where durable corruption fired and no
+    /// `on_dead` hook failed, under `injected corruption cut an enqueue after
+    /// its call reached the remote` with the check's text as its detail, and
+    /// on nothing else. The give-up is named on `sim`; the caller returns
+    /// `Ok(())`.
     ///
     /// # Errors
     ///
@@ -339,7 +343,9 @@ impl<'s> Drive<'s> {
     ///   carries that key …`, unchanged.
     /// - A Dead job whose `on_dead` hook failed: [`dead_hooks_succeeded`]'s
     ///   text, `dead_hooks_succeeded: job <id> ("<name>") is Dead and its
-    ///   on_dead hook failed: …`, unchanged.
+    ///   on_dead hook failed: …`, unchanged. It fails the run even where a
+    ///   call with no durable job, under durable corruption, would have given
+    ///   it up: a failure outranks a give-up.
     /// - A failed read of the store, after a run, in the store's words.
     /// - An app that declares a host the workload registered no model for:
     ///   the missing-remote text [`Drive::faulted_phase`] gives.
@@ -437,17 +443,21 @@ impl<'s> Drive<'s> {
         };
         let snap = kernel.app().db().snapshot().map_err(|e| e.to_string())?;
         keys_are_per_effect(&snap)?;
-        if let Err(e) = calls_have_durable_jobs(sim, &snap) {
-            if durable_corruption_fired(sim) {
-                sim.give_up(
-                    "injected corruption cut an enqueue after its call reached the remote",
-                    e,
-                );
-                return Ok(None);
-            }
-            return Err(e);
-        }
+        let orphan = match calls_have_durable_jobs(sim, &snap) {
+            Ok(()) => None,
+            Err(e) if durable_corruption_fired(sim) => Some(e),
+            Err(e) => return Err(e),
+        };
+        // A failure outranks a give-up, so the hooks are judged before the
+        // corruption excuses the orphan call.
         dead_hooks_succeeded(&snap)?;
+        if let Some(e) = orphan {
+            sim.give_up(
+                "injected corruption cut an enqueue after its call reached the remote",
+                e,
+            );
+            return Ok(None);
+        }
         mark_dead_coverage(sim, kernel.app())?;
         let mut resent = vec![None; phase.requests.len()];
         let answers = answers
