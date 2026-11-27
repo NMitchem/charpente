@@ -10127,3 +10127,13 @@ Noah the same day. Plan commit `0fa8aa90`.
     byte-identical to its pre-change log; `guide-examples` 11 of 11 binaries ok before and
     after the docs fixes; `cargo build -p charpente --examples`, fmt and clippy `-D
     warnings` clean. The workspace suite is the controller's, run after.
+  - The controller's run at `84edeb67`: fmt and clippy `-D warnings` clean; `cargo test
+    --workspace --no-fail-fast` 109 of 109 binaries (106 `test result: ok`, 3 `sim result:
+    ok`), 2418 passed, 0 failed, 66 ignored, one more passed than at `d07debf9` (M1's
+    test); `scripts/edge-harness.sh` 11 of 11 binaries, 47 passed.
+  - Open, for a follow-up: `crates/charpente/examples/api.rs`'s comment above
+    `mark_dead_coverage` says `recover` runs "the three checks above", but those include
+    `outbound_settles_by_horizon`, which it does not run, and leave out
+    `dead_hooks_succeeded`, which it does (Task 2 used the plan's dictated text); and
+    `calls_have_durable_jobs`'s rustdoc and GUIDE checker-list entry do not yet say a failed
+    hook outranks its give-up.
