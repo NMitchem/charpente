@@ -1,12 +1,12 @@
 # Charpente: Architecture & Design
 
-Status: M0 through M3 shipped (launch, 0.1.0 on crates.io, 2026-10-10). PLAN.md's "After
-launch (v1.x)" table holds what comes next. This document records the decisions the rest of
-the design rests on, and the reasons for them. Decisions marked **[IRREVERSIBLE]** cannot be
-retrofitted and are argued in detail. Everything else is chosen for speed and has a clear
-upgrade path. Sections marked "(v0/v1, implemented)" describe the tree as it stands, and the
-rest is design intent that hasn't been built yet. docs/LEDGER.md is the chronological record
-of what shipped when.
+Status: M0 through M3 shipped (launch, 0.1.0 on crates.io, 2026-10-10). What comes next is
+PLAN.md's 1.0 section (DECISIONS §16), and its after-launch table holds the trigger-gated
+work. This document records the decisions the rest of the design rests on, and the reasons
+for them. Decisions marked **[IRREVERSIBLE]** cannot be retrofitted and are argued in
+detail. Everything else is chosen for speed and has a clear upgrade path. Sections marked
+"(v0/v1, implemented)" describe the tree as it stands, and the rest is design intent that
+hasn't been built yet. docs/LEDGER.md is the chronological record of what shipped when.
 
 ## 0. System overview
 

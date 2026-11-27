@@ -3992,8 +3992,8 @@ The window has ended by 2 s + 4 h of virtual time in every run, so work due
 after that, such as a renewal a day out, never meets an outage. And a call
 lands before the window opens only when it is made in the run's first two
 seconds, ahead of the drawn start, so "a call landed, then the host went away"
-is rare. A sim cannot place the window today: PLAN.md's v1.x row "An outage a
-sim can place" holds that open question. Measure a required key's
+is rare. A sim cannot place the window today: PLAN.md's after-launch row "An
+outage a sim can place" holds that open question. Measure a required key's
 rate before you rely on it, and write the rate beside the `require`, as the
 fixture does: a fresh `cargo test` batch is 256 runs.
 
@@ -5162,7 +5162,7 @@ from its own stream (`outbound_outage`) after the clock axes, and a
 
 So no outage reaches work due after 2 s + 4 h of virtual time, and a call that
 lands before the window opens is rare ("Coverage for a Dead path" above, and
-PLAN.md's v1.x row "An outage a sim can place").
+PLAN.md's after-launch row "An outage a sim can place").
 
 ### Calling the outside world in a sim
 
