@@ -10069,6 +10069,7 @@ Noah the same day. Plan commit `0fa8aa90`.
     | example `drawn_inputs` | 1 of 1 | 495 |
     | example `restart_under_faults` | 1 of 1 | 423 |
 
+  - Fresh-seed batches have no recorded baseline, so they show green, not identity. What covers the spec's "no seed may replay differently" is the recorded batches: the double-charge GOLDEN, the pinned-seed and pinned-base tests and the recorded app batches all passed in the workspace suite at `d07debf9`, and the one GOLDEN line that moved is the one named above.
   - The new give-up reason fired in `modelled_remote`, 5 runs (first seed
     `0xe6eaecc69430c272`). That is the only batch where `Drive` hit it. outbound-fixture's
     batch, which drives recovery by hand, listed 2 runs under its own older wording,
