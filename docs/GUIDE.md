@@ -4051,8 +4051,10 @@ the epoch is below every clock reading, so the seeded key is never ahead of
 the node.
 
 `recover` gives `Ok(None)` when the run gave up by name, on a boot refused for
-durable corruption and on nothing else. Return `Ok(())` then. Its errors fail
-the run:
+durable corruption, or on a call that reached a remote with no durable job
+where durable corruption fired ("The platform's rules, checked after the
+tail", above), and on nothing else. Return `Ok(())` then. Its errors fail the
+run:
 
 - `the fault-free tail could not boot`: every boot met fault fallout, and
   nothing gave the run up.
@@ -4092,6 +4094,10 @@ row the kernel lost, not the app's: report it with the run's seed.
 ```text
 Drive::recover: outbound job <id> ("<name>") is still Pending at attempt <a>, due <due>, and the tail ran <n> extension<s>, the last to the year 2262, past which it does not run — a due time that far out means the job's retry backoff grew past the year 2262, so no run reaches its next attempt; give the job a retry policy that ends, a retry(max = …) small enough that it reaches Dead
 ```
+
+- A failing platform check, in its own words: `keys_are_per_effect: …`,
+  `calls_have_durable_jobs: …` or `dead_hooks_succeeded: …` ("The checkers",
+  below).
 
 **When to drop below the helper.** `Drive` is one faulted phase and one tail.
 A workload with more than that builds it from the pieces this section and
