@@ -10190,3 +10190,41 @@ plan `565aacab`. No product code changed.
   at `565aacab`. `cargo test -p charpente-cli --test demo readme` passes (1 ok line, 3
   tests). `cargo fmt --all --check` exits 0. Clippy and the workspace suite were not rerun:
   nothing but docs and one census exemption changed.
+
+## 2026-11-27 — 0.7.0 published to crates.io
+
+- **The push.** Noah pushed `b2c48266..770d95dd`, 16 commits: the four doc fixes left open by
+  the `Drive::recover` entry above (`4754fe9c`) and the road-to-1.0 document pass. CI run
+  46017263610 passed (`check`, `ts-client`). Before the push, at `38806d27`, fmt and clippy
+  `-D warnings` were clean, `cargo test --workspace --no-fail-fast` passed 109 of 109 binaries
+  (2418 passed, 0 failed, 66 ignored), and `scripts/edge-harness.sh` passed 11 of 11 binaries
+  (47 tests). The road-to-1.0 fix wave after it changed seven markdown files and nothing else,
+  so only the tests that read them were rerun at `770d95dd`: `guide-examples` (its
+  `claims_census` reads README and MANIFESTO, `doc_inventory` reads CLAUDE.md) 11 of 11
+  binaries, and `charpente-cli --test demo` (README's quoted runs) 10 passed.
+- **The publish.** Noah ran `cargo publish --workspace` at `770d95dd`. Its verify step built all
+  six packaged crates, and `charpente-core`, `charpente-macros`, `charpente`, `charpente-sim`,
+  `charpente-tsgen` and `charpente-cli` 0.7.0 are on crates.io. Each crate's
+  `.cargo_vcs_info.json` names `770d95dd`, and none is marked dirty.
+- **The registry smoke.** It ran in an empty directory outside any repo, with no cargo config
+  and `CARGO_TARGET_DIR` unset. These steps exit 0 on rustc 1.99.0 and on rustup's `stable`,
+  rustc 1.100.0, installing to a scratch root:
+  - `cargo install charpente-cli --version 0.7.0 --locked`.
+  - `charpente --version`, which prints `charpente 0.7.0`.
+  - `charpente new smokeapp`, which writes `charpente = "0.7"` and `charpente-sim = "0.7"`.
+  - `cargo clippy --all-targets -- -D warnings`.
+  - `charpente test --sim`: 4 passed under master `0x65527101bf44ccb6` on 1.99, and 4 passed
+    under master `0x1c90f9fc7027429a` on 1.100. The scaffold's `Cargo.lock` has 101 `source`
+    lines, all `registry+https://github.com/rust-lang/crates.io-index`.
+- **The demo's `Cargo.lock`** (`2f78a896`). It was seeded from the workspace lock, as 0.6.0's
+  `efb73ee5` was. The resolve against crates.io moved only charpente's four crates, from 0.6.0
+  to 0.7.0 (their four version lines and four checksum lines), and kept every other version:
+  101 packages, 100 registry sources, redb 4.3.0.
+- **The demo from a fresh clone.** A clone of `2f78a896` was run with the CLI installed from
+  crates.io, on the repo's pinned rustc 1.99.0. In `examples/double-charge`,
+  `charpente test --sim --master-seed 0x434841524745` exits 0, and its stderr plus stdout, 761
+  bytes, is byte-identical to README's 0.7.0 block. The run left the clone's tree clean.
+- **Records.** CHANGELOG's heading is dated `0.7.0 (2026-11-27)` (`2f78a896`).
+- **Still owed:** the tag `v0.7.0` at `770d95dd` and its GitHub release, carrying CHANGELOG's
+  0.7.0 section, both Noah's to push. docs/BENCH.md's wire numbers predate intent rows, so no
+  0.7.0 figure is quoted until they are measured again.
