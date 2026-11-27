@@ -9,7 +9,7 @@
 //! let drive = Drive::new(sim, build_app);
 //! let phase = drive.faulted_phase(&requests, Duration::from_secs(2))?; // steps 1 and 2
 //! let Some(recovered) = drive.recover(&phase, Duration::from_secs(30))? else {
-//!     return Ok(()); // given up on a durable refusal
+//!     return Ok(()); // given up by name
 //! }; // steps 3 and 4
 //! let snap = recovered.kernel.app().db().snapshot().map_err(|e| e.to_string())?;
 //! ```

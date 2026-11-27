@@ -10047,9 +10047,8 @@ Noah the same day. Plan commit `0fa8aa90`.
   - No other test went red under any of them, and none left the suite green.
 - **GOLDEN:** one line moved in `crates/charpente-cli/tests/demo.rs` (and README), "reached
   the gateway" to "reached the remote". Its count (1) and first seed
-  (`0x11c23979e56d3608`) did not change, nor did any other GOLDEN line. The app's own text
-  still says "gateway"; the batch prints "remote" only because `recover` gives the universe
-  up first.
+  (`0x11c23979e56d3608`) did not change, nor did any other GOLDEN line. Task 1 left the
+  app's own give-up (it said "gateway") unreachable, and Task 2 deleted it.
 - **Evidence at `d07debf9`:**
   - fmt and clippy `-D warnings` are clean. The workspace suite passes 109 of 109 binaries
     (106 `test result: ok`, 3 `sim result: ok`; 2417 passed, 0 failed, 66 ignored), the same
@@ -10095,3 +10094,36 @@ Noah the same day. Plan commit `0fa8aa90`.
   - R6: the controller ran Task 3 Step 1 (fmt, clippy, workspace suite, edge rig) itself and
     the subagent ran the seed batches, since the suite can pass the 600 s tool limit and a
     backgrounded subagent run stalls. Cost: a few count lines in controller context.
+- **Final review and its fix wave.** The final whole-branch review of
+  `0fa8aa90..a15879a7` (`.superpowers/sdd/2026-11-26-drive-runs-platform-checks/final-review.md`)
+  said "With fixes": 0 Critical, 1 Important (I1), 5 Minor (M1 to M5), and 7 deferred minors
+  triaged, 3 to fix and 4 to leave.
+  - `b6845bd8` takes M1 (controller ruling R9). `recover` binds `calls_have_durable_jobs`'s
+    result, runs `dead_hooks_succeeded`, and gives up on the bound orphan error only after
+    the hooks pass, so a failed hook outranks the corruption give-up, as `Sim::give_up`'s
+    "failures outrank give-ups" says. The call order is unchanged, and a failure with no
+    corruption still comes back at once. Its rustdoc, GUIDE §8 and the CHANGELOG bullet
+    state the precedence. Red first: `recover_fails_a_failed_hook_where_an_orphan_call_would_give_up`
+    (seed `0xD7_0C04`, no faults; `Hapless`, an orphan call, `fault:bit_flip`) failed before
+    the change, because `recover` gave the run up. Mutation: guarding the hook check with
+    `if orphan.is_none()` turned exactly that test red (`tests/drive.rs` 36 passed, 1
+    failed); restored with `cp` and `touch`, and `cmp` against the saved copy was clean.
+  - The docs commit that carries this bullet takes the rest. I1: GUIDE's "as `Drive` has
+    it" list names the second give-up and its precedence, and the checks to run after the
+    tail. Deferred 1: `drive.rs`'s module sketch says "given up by name". Deferred 4 with
+    M2: CHANGELOG's "What breaks" names the general cases (a workload's own give-up after
+    `recover` never runs, a workload that never called the check now skips those runs, and
+    a run `recover` fails or gives up marks no `dead:` key), and GUIDE's "Coverage for a
+    Dead path" says the last. Deferred 5: CHANGELOG says reading the deliveries runs any
+    delivery already due, in the order the next reader would. M3: `api.rs`'s two comments.
+    M4: GUIDE's "three outbound rules". M5: this entry's GOLDEN sentence.
+  - Left, per the review's triage: deferred 2 (no shipped `Drive` workload calls the
+    checks, and the sentence reads as "need call none"), 3 (no reorder yields a verdict a
+    batch would miss, and M1's test now pins hooks before the give-up), 6 (a source-only
+    wrap in a planning doc) and 7 (the heading matches the 2026-11-25 entry's form).
+  - Verification: `charpente-sim` 8 of 8 binaries ok (`tests/drive.rs` 37 passed);
+    `charpente-cli --test demo` 10 passed with the GOLDEN byte-identical, `--test new` 20
+    passed and 1 ignored; `modelled_remote --runs 500 --master-seed 0x31c46d1f0d632cc2`
+    byte-identical to its pre-change log; `guide-examples` 11 of 11 binaries ok before and
+    after the docs fixes; `cargo build -p charpente --examples`, fmt and clippy `-D
+    warnings` clean. The workspace suite is the controller's, run after.

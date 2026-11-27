@@ -3971,7 +3971,8 @@ injected corruption cut an enqueue after its call reached the remote
 
 **Coverage for a Dead path.** Last, `recover` calls `mark_dead_coverage`
 ("The checkers"), which marks `dead:<job>` once per Dead row, whatever the
-job's stance: `dead:SendReceipt` for a `SendReceipt` job. Require it to hold
+job's stance: `dead:SendReceipt` for a `SendReceipt` job. A run that `recover`
+fails or gives up returns before it and marks none. Require it to hold
 that the job's Dead path ran, as `crates/outbound-fixture`'s sim does:
 `orders_charge_once require ["outbound:checked", "outbound-fixture:re-called",
 "dead:SendReceipt"]`. A batch in which no run takes the job to Dead fails on
@@ -4117,9 +4118,15 @@ route or the workload (above). Keep each step's rule as `Drive` has it:
 - use the fallout filter in every step;
 - treat a crash in the faulted phase as the crash under test, not a skip;
 - quiesce before the tail boots, and wait out a clock refusal;
-- give up only on a durable refusal;
+- give up only on a durable refusal, or on a `calls_have_durable_jobs`
+  failure where `durable_corruption_fired`, and on that one only once
+  `dead_hooks_succeeded` has passed, since a failure outranks a give-up;
 - give each write an intent id (`Request::intent`) before the phase sends
-  it, and re-send in the tail what went unanswered as that same copy.
+  it, and re-send in the tail what went unanswered as that same copy;
+- after the tail, run `keys_are_per_effect`, `calls_have_durable_jobs` and
+  `dead_hooks_succeeded` on the last kernel's store, then
+  `outbound_settles_by_horizon` (which `Drive`'s settle loop makes unfailable
+  and a hand loop does not), then `mark_dead_coverage`.
 
 A check that runs at the end of a run — a checkpoint, a graceful close, a
 byte comparison of two nodes' files — does IO, and the run's
@@ -5166,8 +5173,9 @@ helper, build the handle before the kernel, since
 `sim.outbound(&app.outbound_hosts())` borrows the app that
 `Kernel::with_outbound` takes. The workload below takes two orders under the
 run's faults, then runs the fault-free tail ("A fault-free tail" above) and
-judges its own property. `recover` has already run the three outbound rules
-on the tail's store:
+judges its own property. `recover` has already judged the outbound rules on
+the tail's store: a key per request and a durable job behind every call, and,
+through its settle loop, every due job settled:
 
 ```rust
 use charpente::core::job::JobRow;

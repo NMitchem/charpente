@@ -1157,10 +1157,12 @@ fn remotes(sim: &Sim) {
 }
 
 /// `charpente_sim::checks`: the platform's oracles and its fault-fallout
-/// vocabulary. A test on `drive` uses the end-state ones; the boot and clock
-/// helpers are what `drive` runs. `app` is the tail kernel's
-/// (`recovered.kernel.app()`), `snap` its store, and `at` the wall time the
-/// tail stopped at (`recovered.wall`).
+/// vocabulary. A test on `drive` gets the end-state ones from
+/// `Drive::recover`, and a hand driver calls them; the boot and clock helpers
+/// are what `drive` runs. `app` is the tail kernel's
+/// (`recovered.kernel.app()`), `snap` its store, and `at` the wall time
+/// `recover`'s settle loop judged due times at when it stopped
+/// (`recovered.wall`).
 fn checks(
     sim: &mut Sim,
     app: &App,
@@ -1297,9 +1299,9 @@ fn drive(sim: &Sim, body: NoteBody) -> Result<(), String> {
     let _status: Option<u16> = recovered.status(0).or(phase.status(0));
     // Each re-send's `(status, body)`, by the index of the request it re-sent.
     let _resent: &Vec<Option<(u16, Vec<u8>)>> = &recovered.resent;
-    // The wall time the tail stopped at, the greater of the clock's reading
-    // and the kernel's held wall, what `outbound_settles_by_horizon` judges
-    // at, and how many extensions the tail ran for outbound work.
+    // The wall time `recover`'s settle loop judged due times at when it
+    // stopped, the greater of the clock's reading and the kernel's held wall,
+    // and how many extensions the tail ran for outbound work.
     let _at: WallTime = recovered.wall;
     let _extensions: u32 = recovered.extensions;
     assert!(_extensions <= TAIL_SETTLE_CAP);
