@@ -21,22 +21,22 @@ which is why they are written down:
   events commit in the same transaction. Replication ships the log, subscriptions tail
   it, failover replays it, the simulator feeds it. Introducing a second place where
   things become true is the one architectural mistake this codebase cannot absorb.
-- **The framework is the reviewer.** Compile-time contracts are the oracle for the shape of
-  business logic — a schema change that breaks a query must be a compile error, not a
+- **The framework is the reviewer.** Compile-time contracts are the oracle for the shape
+  of business logic — a schema change that breaks a query must be a compile error, not a
   500 — and promises the builder can't edit judge its values, which is 1.0 work.
-  Deterministic simulation is the oracle for everything beneath it. That is why error
-  text and seeds are product surface rather than developer conveniences (hard rules 5
-  and 3).
+  Deterministic simulation is the oracle for everything beneath business logic. That is
+  why error text and seeds are product surface rather than developer conveniences (hard
+  rules 5 and 3).
 - **Constraints are the feature.** No network await inside a transaction. A programming
   model that admits nondeterminism cannot be replayed; one that forbids it replays byte
   for byte from a seed. If a feature seems to need an escape hatch, the design is wrong
   (hard rule 2).
-- **The verdict can't change without the change showing.** An app's promises live apart
-  from the code its builder writes, and a verdict names what it checked, how, and what
-  nothing checked. charpente's own oracles work the same way: `.cargo/mutants.toml` with
-  its pinned count and one rationale per entry, the claims census's `EXEMPT_COUNT`, and
-  pinned goldens. Each can be edited, as long as the edit is visible, counted and argued
-  (DECISIONS §16).
+- **The verdict can't change without the change showing.** From 1.0, an app's promises
+  will live apart from the code its builder writes, and a verdict will name what it
+  checked, how, and what nothing checked (DECISIONS §16). charpente's own oracles
+  already work this way: `.cargo/mutants.toml` with its pinned count and one rationale
+  per entry, the claims census's `EXEMPT_COUNT`, and pinned goldens. Each can be edited,
+  as long as the edit is visible, counted and argued.
 - **One big box, replicated.** One ordered log on one primary; followers replay it for
   reads and failover. There is no sharding story and there will not be one.
 
@@ -49,9 +49,9 @@ fine later), porting existing apps, and feature flags on determinism.
 An agent-native, single-binary Rust backend platform. M0 through M3 (launch) are complete,
 and charpente is on crates.io, launched as 0.1.0 (CHANGELOG dates each release after its
 crates are on crates.io; see "Current state" below). M0 through M3 were the first
-roadmap. The current one is PLAN.md's 1.0 section (DECISIONS §16). Its "After launch"
-table holds trigger-gated work, each item with the trigger that reopens it, and rows
-marked "In 1.0" are 1.0 work.
+roadmap. The current one is PLAN.md's 1.0 section (DECISIONS §16). PLAN.md's "After
+launch" table holds trigger-gated work, each item with the trigger that reopens it, and
+rows marked "In 1.0" are 1.0 work.
 
 ## Commands
 
@@ -256,7 +256,8 @@ marked "In 1.0" are 1.0 work.
 
 **M0 through M3 shipped, and M3 (launch) closed 2026-10-10 with 0.1.0 on crates.io. The
 1.0 milestone was defined 2026-11-26: PLAN.md's 1.0 section, DECISIONS §16, and
-docs/superpowers/specs/2026-11-26-road-to-1-0-design.md.** That is deliberately all the status this file carries. Task-level state goes stale every time a task lands, and a
+docs/superpowers/specs/2026-11-26-road-to-1-0-design.md.** That is deliberately all the
+status this file carries. Task-level state goes stale every time a task lands, and a
 stale instruction is worse than an absent one — so the chronological record is
 **[docs/LEDGER.md](docs/LEDGER.md)**, and per-plan mid-flight state lives in
 `.superpowers/sdd/<date>-<name>/progress.md` (gitignored: local working files, absent from
